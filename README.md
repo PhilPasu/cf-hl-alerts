@@ -2,7 +2,7 @@
 
 
 
-Cloudflare Worker for Hyperliquid liquidation + health alerts and Telegram commands (/status, /positions).
+Cloudflare Worker for Hyperliquid liquidation + health alerts and Telegram commands.
 
 \- Deployed with Wrangler
 
