@@ -1,0 +1,20 @@
+# Node / build
+node_modules/
+dist/
+build/
+.esbuild/
+.turbo/
+
+# Cloudflare wrangler caches
+.wrangler/
+
+# Local env files (KEEP THEM OUT OF GIT)
+.env
+.env.*
+.dev.vars
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.log
