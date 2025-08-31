@@ -14,8 +14,6 @@ Cloudflare Worker for Hyperliquid liquidation + health alerts and Telegram comma
 
 \- `/status` — per-account: 🔷 Cross (portfolio overview), then 🟨 Isolated (per-coin)
 
-\- `/positions` — same structure
-
 \- `/ping` — bot liveness
 
 
