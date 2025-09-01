@@ -1,13 +1,10 @@
-# ======================================================================
-# FILE: README.md
-# ======================================================================
-# hl-alerts — Hyperliquid → Telegram (Cloudflare Worker, zero-key)
+hl-alerts — Hyperliquid → Telegram (Cloudflare Worker, zero-key)
 
 A tiny Cloudflare Worker that watches **Hyperliquid** accounts using **public endpoints only** (no API keys) and sends alerts & status to **Telegram**.
 
 ---
 
-## Features
+Features
 - ✅ Runs 24/7 on Cloudflare’s edge (free tier friendly)
 - ✅ No private keys; read-only via Hyperliquid `info` API
 - ✅ Telegram commands: `/status`, `/positions`, `/ping`, `/help`
@@ -17,7 +14,7 @@ A tiny Cloudflare Worker that watches **Hyperliquid** accounts using **public en
   - **Cross (account)**: `Leverage`, `Health`
   - **Isolated (per position)**: `🪙 coin`, `Leverage`, `Health`
 
-### Health formulas
+Health formulas
 - **Cross (account)**:  
   `Health = (Balance − Maintenance) / (Balance − Unrealized PnL)` → clamp to **[0, 100]%**
 - **Isolated (position)**:  
@@ -27,7 +24,7 @@ A tiny Cloudflare Worker that watches **Hyperliquid** accounts using **public en
 
 ---
 
-## Requirements
+Requirements
 - Cloudflare account
 - Node.js 18+
 - Wrangler CLI: `npm i -g wrangler`
