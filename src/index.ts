@@ -322,6 +322,7 @@ function classifyPositions(resp: any, accountCrossUsed: boolean) {
 
 /* =================== Health calculations =================== */
 
+// cross-account health: (Balance - Maintenance) / (Balance - UPNL), clamped [0,100]
 function healthAccountPct(balance: number, maint: number, upnl: number): number | null {
   const denom = balance - upnl;
   if (!(isFinite(balance) && isFinite(maint) && isFinite(upnl))) return null;
@@ -330,6 +331,7 @@ function healthAccountPct(balance: number, maint: number, upnl: number): number 
   return clamp01pct(pct);
 }
 
+// isolated per-position health with leverage multiplier, clamped [0,100]
 // long: ((mark - liq)/entry) * leverage * 100, leverage = entry/(entry - liq)
 // short: ((liq - mark)/entry) * leverage * 100, leverage = entry/(liq - entry)
 function healthPosPct(mark: number, liq: number, entry: number, side: string): number | null {
@@ -407,7 +409,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
-      crossBlock.push("( no positions found )");
+      crossBlock.push("( no cross exposure )");
     } else {
       crossBlock.push(
         `🏦 Balance: ${fmtMoney(bal)}`,
@@ -423,7 +425,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
 
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
-      isoBlock.push("( no positions found )");
+      isoBlock.push("( no open positions )");
     } else {
       for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks), "");
       if (isoBlock.at(-1) === "") isoBlock.pop();
@@ -457,7 +459,7 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
-      crossBlock.push("( no positions found )");
+      crossBlock.push("( no cross exposure )");
     } else {
       crossBlock.push(
         `🏦 Balance: ${fmtMoney(ov.accountValue)}`,
@@ -473,7 +475,7 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
 
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
-      isoBlock.push("( no positions found )");
+      isoBlock.push("( no open positions )");
     } else {
       for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks), "");
       if (isoBlock.at(-1) === "") isoBlock.pop();
@@ -490,40 +492,27 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
   return lines.join("\n");
 }
 
-/* ----- render a single position ----- */
+/* ----- simplified isolated position lines (coin, position size, health only) ----- */
 function renderPositionLines(p: any, marks: Record<string, number>): string[] {
-  const coin = p.coin, side = p.side;
+  const coin = p.coin;
   const liq = p.liquidationPx as number | null;
   const entry = p.entryPx as number;
   const szi = p.szi as number;
-  const upnl = p.unrealizedPnl as number;
+  const side = (p.side || "").toLowerCase();
   const mark = marks[coin];
 
+  // Position size in USD using mark if available, else entry
   const pxForSize = isFinite(mark) ? mark : (isFinite(entry) && entry > 0 ? entry : NaN);
   const posSizeUSD = isFinite(pxForSize) ? Math.abs(szi) * pxForSize : NaN;
 
-  let levTxt = "?";
-  if (isFinite(entry) && entry > 0 && isFinite(liq ?? NaN) && (liq as number) > 0) {
-    const denom = side.toLowerCase().startsWith("long") ? (entry - (liq as number)) : ((liq as number) - entry);
-    if (denom > 0) {
-      const lev = entry / denom;
-      if (isFinite(lev)) levTxt = `${Math.round(lev)}x`;
-    }
-  }
-
+  // Health with leverage multiplier, clamped [0,100]
   const h = (isFinite(mark) && isFinite(entry) && isFinite(liq ?? NaN))
     ? healthPosPct(mark, liq as number, entry, side)
     : null;
 
   return [
-    `🪙 ${coin} — ${side.toUpperCase()}`,
-    `📏 Size: ${isFinite(szi) ? szi : "?"}`,
-    `🎯 Entry: ${isFinite(entry) ? to6(entry) : "?"}`,
-    `🧭 Mark: ${isFinite(mark) ? to6(mark) : "?"}`,
-    `☠️ Liq: ${isFinite(liq ?? NaN) ? to6(liq as number) : "?"}`,
+    `🪙 ${coin}`,
     `💰 Position Size: ${isFinite(posSizeUSD) ? fmtMoney(posSizeUSD) : "?"}`,
-    `📉 Unrealized PnL: ${fmtMoney(upnl)}`,
-    `📈 Leverage: ${levTxt}`,
     `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
   ];
 }
