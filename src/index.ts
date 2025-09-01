@@ -3,7 +3,11 @@ export interface Env {
   TG_CHAT_ID: string; // default chat for cron alerts
   ADDRESSES_CSV: string; // "Name|0xabc..., 0xdef..., Team - 0x123..."
   HL_INFO?: string; // optional override
-  HL_ALERT_STATE: KVNamespace; // KV binding for cooldowns
+  HL_ALERT_STATE: KVNamespace; // KV binding for cooldowns/state
+
+  // Optional: identify cron expressions (so we know which fired)
+  POLL_CRON?: string;  // default: "*/1 * * * *"
+  DAILY_CRON?: string; // default: "0 0 * * *"
 }
 
 type Update = {
@@ -14,7 +18,6 @@ type Update = {
 };
 
 const SEP = "────────────────────────────────────────────────────";
-const cooldownMs = () => 30 * 60 * 1000; // 30 mins
 const HL_INFO = (env: Env) => env.HL_INFO || "https://api.hyperliquid.xyz/info";
 
 /* =================== Worker handlers =================== */
@@ -35,7 +38,7 @@ export default {
         if (text.startsWith("/status")) {
           const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
           const report = await buildAccountOverviewReport(env, addresses, nameMap);
-          for (const chunk of chunkMessage(report)) await tgSend(env, chatId, chunk);
+          for (const chunk of chunkMessage("📅 <b>Daily Status</b>\n\n" + report)) await tgSend(env, chatId, chunk);
         } else if (text.startsWith("/positions")) {
           const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
           const report = await buildPositionsReport(env, addresses, nameMap);
@@ -48,7 +51,7 @@ export default {
             chatId,
             [
               "Commands:",
-              "/status — per-account: 🔷 Cross (portfolio overview), then 🟨 Isolated (per-coin)",
+              "/status — per-account: 🔷 Cross (Leverage / Health), then 🟨 Isolated (coin / leverage / health)",
               "/positions — same structure as /status",
               "/ping — check if bot is alive",
             ].join("\n")
@@ -63,57 +66,64 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
     try {
-      const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
-      if (!addresses.length) return;
+      const pollExpr = env.POLL_CRON || "*/1 * * * *";
+      const dailyExpr = env.DAILY_CRON || "0 0 * * *";
+      const which = (event as any).cron as string | undefined;
 
-      for (let i = 0; i < addresses.length; i++) {
-        const addr = addresses[i];
-        const ov = await getAccountOverview(env, addr);
-        if (!ov) continue;
-
-        const balance = num(ov.accountValue);
-        if (!isFinite(balance) || balance <= 0) continue; // skip empty accounts
-
-        const maint = num(ov.crossMaintMargin);
-        const upnl = num(ov.unrealizedPnl);
-        const h = healthAccountPct(balance, maint, upnl);
-        if (h == null) continue;
-
-        const tier = tierFor(h); // 1:<10%, 2:<5%, 3:=0%
-        const key = `acct:${addr}`;
-        const state =
-          (await readState(env, key)) || { lastTier: 0, lastTsByTier: {} as Record<string, number> };
-
-        let should = false;
-        if (tier > state.lastTier) should = true; // escalation triggers immediately
-        else if (tier > 0 && tier === state.lastTier) {
-          const last = state.lastTsByTier[String(tier)] || 0;
-          if (Date.now() - last >= cooldownMs()) should = true; // 30-min same-tier cooldown
+      // Daily summary (/status) — independent of near-liq alert gating
+      if (which === dailyExpr) {
+        const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
+        if (!addresses.length) return;
+        const report = await buildAccountOverviewReport(env, addresses, nameMap);
+        for (const chunk of chunkMessage("📅 <b>Daily Status</b>\n\n" + report)) {
+          await tgSend(env, env.TG_CHAT_ID, chunk);
         }
+        return;
+      }
 
-        if (should && tier > 0) {
-          const idx = i + 1;
-          const title = `<b>Account ${idx}</b>: ${labelFor(addr, nameMap)}`;
-          const threshTxt = tier === 3 ? "= 0.00%" : tier === 2 ? "< 5.00%" : "< 10.00%";
-          const msg = [
-            `⚠️ <b>Near Liquidation</b> — Level ${tier}/3 (${threshTxt})`,
-            `${title}`,
-            "",
-            `🏦 Balance: ${fmtMoney(balance)}`,
-            `🛡️ Maintenance Margin: ${fmtMoney(maint)}`,
-            `📉 Unrealized PnL: ${fmtMoney(upnl)}`,
-            `❤️ Health: ${fmtPct(h)}`
-          ].join("\n");
+      // Frequent poll (e.g., every minute): tiered health alerts with per-day gating
+      if (which === pollExpr || which === undefined) {
+        const { addresses } = parseAddrBook(env.ADDRESSES_CSV || "");
+        if (!addresses.length) return;
 
-          await tgSend(env, env.TG_CHAT_ID, msg);
-          state.lastTier = tier;
-          state.lastTsByTier[String(tier)] = Date.now();
-          await writeState(env, key, state);
-        } else {
-          state.lastTier = tier;
-          await writeState(env, key, state);
+        const today = todayKeyUTC(); // resets automatically at new UTC day
+
+        for (let i = 0; i < addresses.length; i++) {
+          const addr = addresses[i];
+          const ov = await getAccountOverview(env, addr);
+          if (!ov) continue;
+
+          const balance = num(ov.accountValue);
+          if (!isFinite(balance) || balance <= 0) continue; // skip empty accounts
+
+          const maint = num(ov.crossMaintMargin);
+          const upnl = num(ov.unrealizedPnl);
+          const h = healthAccountPct(balance, maint, upnl);
+          const tier = tierFor(h);
+          if (tier === 0) continue; // no alert
+
+          const key = `acct:${addr}:${today}`;
+          const state = (await readState(env, key)) || { sent: {} as Record<string, boolean> };
+
+          // Only send this tier once per day
+          if (!state.sent[String(tier)]) {
+            const idx = i + 1;
+            const title = `<b>Account ${idx}</b>`;
+            const threshTxt = tierThreshText(tier);
+            const msg = [
+              `⚠️ <b>Near Liquidation</b> — Level ${tier}/4 (${threshTxt})`,
+              `${title}`,
+              "",
+              `📈 Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
+              `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
+            ].join("\n");
+
+            await tgSend(env, env.TG_CHAT_ID, msg);
+            state.sent[String(tier)] = true;
+            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // expire ~26h to survive clock skews
+          }
         }
       }
     } catch (e) {
@@ -123,6 +133,10 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /* =================== helpers =================== */
+
+function todayKeyUTC(): string {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
 
 function chunkMessage(text: string): string[] {
   const MAX = 3800;
@@ -150,18 +164,8 @@ function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<stri
     if (!m) continue;
     const addr = m[0];
     if (!addresses.includes(addr)) addresses.push(addr);
-    const parts = it.split(addr);
-    const left = (parts[0] || "").replace(/[|\-:=\s]+$/g, "").trim();
-    const right = (parts[1] || "").replace(/^[|\-:=\s]+/g, "").trim();
-    const label = left || right;
-    if (label && !nameMap[addr]) nameMap[addr] = label;
   }
   return { addresses, nameMap };
-}
-
-function labelFor(addr: string, nameMap: Record<string, string>): string {
-  const name = nameMap[addr];
-  return name ? `${name} — <code>${addr}</code>` : `<code>${addr}</code>`;
 }
 
 function fmtMoney(x: number | null | undefined): string {
@@ -177,7 +181,6 @@ function fmtX(x: number | null | undefined): string {
   return `${x.toFixed(2)}x`;
 }
 const num = (v: any) => (v == null ? NaN : Number(v));
-function to6(x: number) { return Number(x).toPrecision(6); }
 
 /* =================== Telegram =================== */
 
@@ -355,12 +358,22 @@ function healthPosPct(mark: number, liq: number, entry: number, side: string): n
 
 function clamp01pct(x: number) { return Math.min(100, Math.max(0, x)); }
 
+/* ===== new 4-tier thresholds =====
+   1: <50%
+   2: <20%
+   3: <5%
+   4: =0%
+*/
 function tierFor(h?: number | null): number {
   if (h == null || !isFinite(h)) return 0;
-  if (h <= 0) return 3;
-  if (h < 5) return 2;
-  if (h < 10) return 1;
+  if (h <= 0) return 4;
+  if (h < 5) return 3;
+  if (h < 20) return 2;
+  if (h < 50) return 1;
   return 0;
+}
+function tierThreshText(tier: number): string {
+  return tier === 4 ? "= 0.00%" : tier === 3 ? "< 5.00%" : tier === 2 ? "< 20.00%" : "< 50.00%";
 }
 
 /* =================== KV state =================== */
@@ -371,23 +384,22 @@ async function readState(env: Env, key: string): Promise<any | null> {
     return s ? JSON.parse(s) : null;
   } catch { return null; }
 }
-async function writeState(env: Env, key: string, obj: any): Promise<void> {
+async function writeState(env: Env, key: string, obj: any, ttlSeconds?: number): Promise<void> {
   try {
-    await env.HL_ALERT_STATE.put(key, JSON.stringify(obj), { expirationTtl: 60 * 60 * 24 * 14 });
+    await env.HL_ALERT_STATE.put(key, JSON.stringify(obj), ttlSeconds ? { expirationTtl: ttlSeconds } : undefined);
   } catch {}
 }
 
 /* =================== Rendering helpers =================== */
 
-async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap: Record<string, string>): Promise<string> {
+async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
   const lines: string[] = ["📊 <b>Per-Account Overview</b>"];
   const total = addresses.length;
-  const marks = await getMetaAndMarks(env);
 
   for (let i = 0; i < addresses.length; i++) {
     const addr = addresses[i];
     const ov = await getAccountOverview(env, addr);
-    const title = `<b>Account ${i + 1}</b>: ${labelFor(addr, nameMap)}`;
+    const title = `<b>Account ${i + 1}</b>`;
 
     if (!ov) {
       lines.push(`${title}\n\n( no data )`);
@@ -398,31 +410,25 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
     const bal = ov.accountValue;
     const upnl = ov.unrealizedPnl;
     const mm = ov.crossMaintMargin;
-    const cmr = ov.crossMarginRatioPct;
     const lev = ov.crossLeverage;
-    const ntl = ov.totalNtlPos;
-    const mu = ov.totalMarginUsed;
     const h = healthAccountPct(bal, mm, upnl);
 
     const mmUsed = Number(mm || 0) > 0;
-    const { isoPos } = classifyPositions(ov.raw, mmUsed);
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
       crossBlock.push("( no cross exposure )");
     } else {
       crossBlock.push(
-        `🏦 Balance: ${fmtMoney(bal)}`,
-        `📉 Unrealized PnL: ${fmtMoney(upnl)}`,
-        `🛡️ Maintenance Margin: ${fmtMoney(mm)}`,
-        `📐 Cross Margin Ratio: ${cmr == null ? "?" : fmtPct(cmr)}`,
-        `📈 Cross Account Leverage: ${lev == null ? "?" : fmtX(lev)}`,
-        `📦 Notional: ${fmtMoney(ntl)}`,
-        `🧰 Margin Used: ${fmtMoney(mu)}`,
+        `📈 Leverage: ${lev == null ? "?" : fmtX(lev)}`,
         `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
       );
     }
 
+    // Isolated block: coin / leverage / health
+    const raw = ov.raw;
+    const { isoPos } = classifyPositions(raw, mmUsed);
+    const marks = await getMetaAndMarks(env);
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
       isoBlock.push("( no open positions )");
@@ -441,7 +447,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
   return lines.join("\n");
 }
 
-async function buildPositionsReport(env: Env, addresses: string[], nameMap: Record<string, string>): Promise<string> {
+async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
   const marks = await getMetaAndMarks(env);
   const lines: string[] = ["📄 <b>Per-Position Status</b>"];
   const total = addresses.length;
@@ -454,7 +460,7 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
     const mmUsed = Number(ov.crossMaintMargin || 0) > 0;
     const { isoPos } = classifyPositions(raw, mmUsed);
 
-    const title = `<b>Account ${i + 1}</b>: ${labelFor(addr, nameMap)}`;
+    const title = `<b>Account ${i + 1}</b>`;
     const h = healthAccountPct(ov.accountValue, ov.crossMaintMargin, ov.unrealizedPnl);
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
@@ -462,13 +468,7 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
       crossBlock.push("( no cross exposure )");
     } else {
       crossBlock.push(
-        `🏦 Balance: ${fmtMoney(ov.accountValue)}`,
-        `📉 Unrealized PnL: ${fmtMoney(ov.unrealizedPnl)}`,
-        `🛡️ Maintenance Margin: ${fmtMoney(ov.crossMaintMargin)}`,
-        `📐 Cross Margin Ratio: ${ov.crossMarginRatioPct == null ? "?" : fmtPct(ov.crossMarginRatioPct)}`,
-        `📈 Cross Account Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
-        `📦 Notional: ${fmtMoney(ov.totalNtlPos)}`,
-        `🧰 Margin Used: ${fmtMoney(ov.totalMarginUsed)}`,
+        `📈 Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
         `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
       );
     }
@@ -492,27 +492,38 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
   return lines.join("\n");
 }
 
-/* ----- simplified isolated position lines (coin, position size, health only) ----- */
+/* ----- isolated position lines (coin, leverage, health) ----- */
 function renderPositionLines(p: any, marks: Record<string, number>): string[] {
   const coin = p.coin;
   const liq = p.liquidationPx as number | null;
   const entry = p.entryPx as number;
-  const szi = p.szi as number;
   const side = (p.side || "").toLowerCase();
   const mark = marks[coin];
 
-  // Position size in USD using mark if available, else entry
-  const pxForSize = isFinite(mark) ? mark : (isFinite(entry) && entry > 0 ? entry : NaN);
-  const posSizeUSD = isFinite(pxForSize) ? Math.abs(szi) * pxForSize : NaN;
+  // Compute leverage from entry & liq (preferred)
+  let levRaw = NaN;
+  if (isFinite(entry) && entry > 0 && isFinite(liq ?? NaN) && (liq as number) > 0) {
+    const denom = side.startsWith("long") ? (entry - (liq as number)) : ((liq as number) - entry);
+    if (denom > 0) levRaw = entry / denom;
+  }
+  // Fallback: try leverage-like fields from payload
+  if (!isFinite(levRaw) || levRaw <= 0) {
+    const cands = [p.raw?.leverage, p.raw?.lev, p.raw?.x, p.raw?.risk?.leverage];
+    for (const v of cands) {
+      const n = Number(v);
+      if (isFinite(n) && n > 0) { levRaw = n; break; }
+    }
+  }
+  const levDisplay = (isFinite(levRaw) && levRaw > 0) ? Math.round(levRaw) : NaN;
 
-  // Health with leverage multiplier, clamped [0,100]
+  // Health with leverage multiplier (capped [0,100]) — uses current mark
   const h = (isFinite(mark) && isFinite(entry) && isFinite(liq ?? NaN))
     ? healthPosPct(mark, liq as number, entry, side)
     : null;
 
   return [
     `🪙 ${coin}`,
-    `💰 Position Size: ${isFinite(posSizeUSD) ? fmtMoney(posSizeUSD) : "?"}`,
+    `📈 Leverage: ${isFinite(levDisplay) ? `${levDisplay}x` : "?"}`,
     `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
   ];
 }
