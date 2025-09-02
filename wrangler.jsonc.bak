@@ -1,0 +1,15 @@
+name = "hl-alerts"
+main = "src/index.ts"
+compatibility_date = "2025-09-02"
+
+kv_namespaces = [
+  { binding = "HL_ALERT_STATE", id = "YOUR_KV_NAMESPACE_ID" }
+]
+
+[triggers]
+# minute poll AND daily report at 02:00 UTC (= 09:00 Bangkok)
+crons = ["*/1 * * * *", "0 2 * * *"]
+
+[vars]
+POLL_CRON = "*/1 * * * *"
+DAILY_CRON = "0 2 * * *"   # must match the trigger string above
