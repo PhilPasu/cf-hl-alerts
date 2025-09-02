@@ -1,7 +1,7 @@
 export interface Env {
   TG_BOT_TOKEN: string;
   TG_CHAT_ID: string; // default chat for cron alerts
-  ADDRESSES_CSV: string; // "Name|0xabc..., 0xdef..., Team - 0x123..."
+  ADDRESSES_CSV: string; // e.g. "Desk A|0xabc..., 0xdef..., Team - 0x123..."
   HL_INFO?: string; // optional override
   HL_ALERT_STATE: KVNamespace; // KV binding for cooldowns/state
 
@@ -72,7 +72,7 @@ export default {
       const dailyExpr = env.DAILY_CRON || "0 0 * * *";
       const which = (event as any).cron as string | undefined;
 
-      // Daily summary (/status) — independent of near-liq alert gating
+      // Daily summary (/status)
       if (which === dailyExpr) {
         const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
@@ -115,6 +115,7 @@ export default {
             const msg = [
               `⚠️ <b>Near Liquidation</b> — Level ${tier}/4 (${threshTxt})`,
               `${title}`,
+              `🧾 Address: <code>${addr}</code>`,
               "",
               `📈 Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
               `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
@@ -122,7 +123,7 @@ export default {
 
             await tgSend(env, env.TG_CHAT_ID, msg);
             state.sent[String(tier)] = true;
-            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // expire ~26h to survive clock skews
+            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // ~26h
           }
         }
       }
@@ -154,6 +155,13 @@ function chunkMessage(text: string): string[] {
   return chunks;
 }
 
+function shortAddr(addr: string): string {
+  return addr.length > 10 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+}
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<string, string> } {
   const items = (csv || "").split(",").map(s => s.trim()).filter(Boolean);
   const ADDR = /0x[a-fA-F0-9]{40}/;
@@ -164,14 +172,15 @@ function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<stri
     if (!m) continue;
     const addr = m[0];
     if (!addresses.includes(addr)) addresses.push(addr);
+
+    // Try to capture an optional name before the address (e.g., "Desk A|0x...", "Team - 0x...")
+    const idx = it.indexOf(addr);
+    const prefix = idx > 0 ? it.slice(0, idx).trim().replace(/[|\-:–—]+$/g, "").trim() : "";
+    if (prefix) nameMap[addr] = prefix;
   }
   return { addresses, nameMap };
 }
 
-function fmtMoney(x: number | null | undefined): string {
-  if (x == null || !isFinite(x)) return "?";
-  return "$" + Number(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
 function fmtPct(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "?";
   return `${x.toFixed(2)}%`;
@@ -392,17 +401,18 @@ async function writeState(env: Env, key: string, obj: any, ttlSeconds?: number):
 
 /* =================== Rendering helpers =================== */
 
-async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
+async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap: Record<string, string>): Promise<string> {
   const lines: string[] = ["📊 <b>Per-Account Overview</b>"];
   const total = addresses.length;
 
   for (let i = 0; i < addresses.length; i++) {
     const addr = addresses[i];
     const ov = await getAccountOverview(env, addr);
+    const human = nameMap[addr] ? ` — ${escapeHtml(nameMap[addr])}` : "";
     const title = `<b>Account ${i + 1}</b>`;
 
     if (!ov) {
-      lines.push(`${title}\n\n( no data )`);
+      lines.push(`${title}\n🧾 Address: <code>${addr}</code>${human}\n\n( no data )`);
       if (i < total - 1) lines.push(SEP);
       continue;
     }
@@ -417,7 +427,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMa
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
-      crossBlock.push("( no cross exposure )");
+      crossBlock.push("( no positions found )");
     } else {
       crossBlock.push(
         `📈 Leverage: ${lev == null ? "?" : fmtX(lev)}`,
@@ -425,19 +435,19 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMa
       );
     }
 
-    // Isolated block: coin / leverage / health
+    // Isolated: coin / leverage / health
     const raw = ov.raw;
     const { isoPos } = classifyPositions(raw, mmUsed);
     const marks = await getMetaAndMarks(env);
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
-      isoBlock.push("( no open positions )");
+      isoBlock.push("( no positions found )");
     } else {
       for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks), "");
       if (isoBlock.at(-1) === "") isoBlock.pop();
     }
 
-    const joined = [title, "", ...crossBlock, "", ...isoBlock]
+    const joined = [title, `🧾 Address: <code>${addr}</code>${human}`, "", ...crossBlock, "", ...isoBlock]
       .join("\n")
       .replace(/\n\n\n+/g, "\n\n");
     lines.push(joined);
@@ -447,7 +457,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMa
   return lines.join("\n");
 }
 
-async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
+async function buildPositionsReport(env: Env, addresses: string[], nameMap: Record<string, string>): Promise<string> {
   const marks = await getMetaAndMarks(env);
   const lines: string[] = ["📄 <b>Per-Position Status</b>"];
   const total = addresses.length;
@@ -456,6 +466,7 @@ async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Rec
     const addr = addresses[i];
     const raw = await hlInfo(env, { type: "clearinghouseState", user: addr });
     const ov = computeOverviewFromRaw(raw);
+    const human = nameMap[addr] ? ` — ${escapeHtml(nameMap[addr])}` : "";
 
     const mmUsed = Number(ov.crossMaintMargin || 0) > 0;
     const { isoPos } = classifyPositions(raw, mmUsed);
@@ -465,7 +476,7 @@ async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Rec
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
-      crossBlock.push("( no cross exposure )");
+      crossBlock.push("( no positions found )");
     } else {
       crossBlock.push(
         `📈 Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
@@ -475,13 +486,13 @@ async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Rec
 
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
-      isoBlock.push("( no open positions )");
+      isoBlock.push("( no positions found )");
     } else {
       for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks), "");
       if (isoBlock.at(-1) === "") isoBlock.pop();
     }
 
-    const chunk = [title, "", ...crossBlock, "", ...isoBlock]
+    const chunk = [title, `🧾 Address: <code>${addr}</code>${human}`, "", ...crossBlock, "", ...isoBlock]
       .join("\n")
       .replace(/\n\n\n+/g, "\n\n");
     lines.push(chunk);
