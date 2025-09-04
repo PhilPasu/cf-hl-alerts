@@ -6,8 +6,9 @@ export interface Env {
   HL_ALERT_STATE: KVNamespace; // KV binding for cooldowns/state
 
   // Optional: identify cron expressions (so we know which fired)
-  POLL_CRON?: string;  // default: "*/1 * * * *"
-  DAILY_CRON?: string; // default: "0 0 * * *"
+  POLL_CRON?: string;   // default: "*/1 * * * *"   (every minute)
+  DAILY_CRON?: string;  // default: "0 2 * * *"     (09:00 Bangkok)
+  DAILY_CRON_2?: string; // default: "0 14 * * *"   (21:00 Bangkok)
 }
 
 type Update = {
@@ -68,12 +69,13 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
     try {
-      const pollExpr = env.POLL_CRON || "*/1 * * * *";
-      const dailyExpr = env.DAILY_CRON || "0 0 * * *";
+      const pollExpr   = env.POLL_CRON    || "*/1 * * * *";
+      const dailyExpr1 = env.DAILY_CRON   || "0 2 * * *";   // 09:00 Bangkok (UTC+7)
+      const dailyExpr2 = env.DAILY_CRON_2 || "0 14 * * *";  // 21:00 Bangkok (UTC+7)
       const which = (event as any).cron as string | undefined;
 
-      // Daily summary (/status)
-      if (which === dailyExpr) {
+      // Twice-daily summary (09:00 & 21:00 Bangkok)
+      if (which === dailyExpr1 || which === dailyExpr2) {
         const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
         const report = await buildAccountOverviewReport(env, addresses, nameMap);
@@ -173,7 +175,7 @@ function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<stri
     const addr = m[0];
     if (!addresses.includes(addr)) addresses.push(addr);
 
-    // Try to capture an optional name before the address (e.g., "Desk A|0x...", "Team - 0x...")
+    // Optional name prefix (e.g., "Desk A|0x...", "Team - 0x...")
     const idx = it.indexOf(addr);
     const prefix = idx > 0 ? it.slice(0, idx).trim().replace(/[|\-:–—]+$/g, "").trim() : "";
     if (prefix) nameMap[addr] = prefix;
@@ -367,7 +369,7 @@ function healthPosPct(mark: number, liq: number, entry: number, side: string): n
 
 function clamp01pct(x: number) { return Math.min(100, Math.max(0, x)); }
 
-/* ===== new 4-tier thresholds =====
+/* ===== 4-tier thresholds =====
    1: <50%
    2: <20%
    3: <5%
