@@ -1,14 +1,14 @@
 export interface Env {
   TG_BOT_TOKEN: string;
-  TG_CHAT_ID: string; // default chat for cron alerts
-  ADDRESSES_CSV: string; // "Name|0xabc..., 0xdef..., Team - 0x123..."
-  HL_INFO?: string; // optional override
+  TG_CHAT_ID: string;        // default chat for cron alerts
+  ADDRESSES_CSV: string;     // "0xabc..., 0xdef..., Team - 0x123..."
+  HL_INFO?: string;          // optional override
   HL_ALERT_STATE: KVNamespace; // KV binding for cooldowns/state
 
-  // Optional: identify cron expressions (so we know which fired)
-  POLL_CRON?: string;   // default: "*/1 * * * *"
-  DAILY_CRON?: string;  // default: "0 2 * * *"   (09:00 Bangkok)
-  DAILY_CRON_2?: string; // default: "0 14 * * *" (21:00 Bangkok)
+  // Optional cron identifiers so we know which fired
+  POLL_CRON?: string;        // default: "*/1 * * * *"
+  DAILY_CRON?: string;       // first daily (e.g., 09:00 BKK = 02:00 UTC)
+  DAILY_CRON_2?: string;     // second daily (e.g., 21:00 BKK = 14:00 UTC)
 }
 
 type Update = {
@@ -19,7 +19,7 @@ type Update = {
 };
 
 const SEP = "────────────────────────────────────────────────────";
-const HL_INFO = (env: Env) => env.HL_INFO || "https://api.hyperliquid.xyz/info";
+const HL_INFO_URL = (env: Env) => env.HL_INFO || "https://api.hyperliquid.xyz/info";
 
 /* =================== Worker handlers =================== */
 
@@ -52,7 +52,7 @@ export default {
             chatId,
             [
               "Commands:",
-              "/status — per-account: 🔷 Cross (Leverage / Health), then 🟨 Isolated (coin / leverage / health / funding 1h)",
+              "/status — per-account: 🔷 Cross (Leverage / Health), then 🟨 Isolated (coin / leverage / funding / health)",
               "/positions — same structure as /status",
               "/ping — check if bot is alive",
             ].join("\n")
@@ -69,29 +69,28 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
     try {
-      const pollExpr  = env.POLL_CRON   || "*/1 * * * *";
-      const dailyExpr = env.DAILY_CRON  || "0 2 * * *";   // 09:00 Asia/Bangkok
-      const daily2    = env.DAILY_CRON_2|| "0 14 * * *";  // 21:00 Asia/Bangkok
+      const pollExpr  = env.POLL_CRON  || "*/1 * * * *";
+      const dailyExpr = env.DAILY_CRON || "0 2 * * *";   // 09:00 Bangkok (UTC+7) = 02:00 UTC
+      const dailyExpr2= env.DAILY_CRON_2 || "0 14 * * *"; // 21:00 Bangkok = 14:00 UTC
       const which = (event as any).cron as string | undefined;
 
-      // Twice-daily summary
-      if (which === dailyExpr || which === daily2) {
+      // Twice-daily summary (/status) — independent of near-liq alert gating
+      if (which === dailyExpr || which === dailyExpr2) {
         const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
         const report = await buildAccountOverviewReport(env, addresses, nameMap);
-        const banner = which === dailyExpr ? "📅 <b>Morning Status</b>" : "🌙 <b>Evening Status</b>";
-        for (const chunk of chunkMessage(banner + "\n\n" + report)) {
+        for (const chunk of chunkMessage("📅 <b>Daily Status</b>\n\n" + report)) {
           await tgSend(env, env.TG_CHAT_ID, chunk);
         }
         return;
       }
 
-      // Frequent poll: tiered health alerts with per-day gating
+      // Frequent poll (e.g., every minute): tiered health alerts with per-day gating
       if (which === pollExpr || which === undefined) {
         const { addresses } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
 
-        const today = todayKeyUTC(); // resets automatically each UTC day
+        const today = todayKeyUTC(); // resets automatically at new UTC day
 
         for (let i = 0; i < addresses.length; i++) {
           const addr = addresses[i];
@@ -113,7 +112,7 @@ export default {
           // Only send this tier once per day
           if (!state.sent[String(tier)]) {
             const idx = i + 1;
-            const title = `<b>Account ${idx}</b>\n🔗 <code>${addr}</code>`;
+            const title = `<b>Account ${idx}</b>\n🔑 Address: <code>${addr}</code>`;
             const threshTxt = tierThreshText(tier);
             const msg = [
               `⚠️ <b>Near Liquidation</b> — Level ${tier}/4 (${threshTxt})`,
@@ -125,7 +124,7 @@ export default {
 
             await tgSend(env, env.TG_CHAT_ID, msg);
             state.sent[String(tier)] = true;
-            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // ~26h
+            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // ~26h to survive skews
           }
         }
       }
@@ -175,9 +174,11 @@ function fmtPct(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "?";
   return `${x.toFixed(2)}%`;
 }
-function fmtPct4(x: number | null | undefined): string {
+function fmtSignedPctPerHour(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "?";
-  return `${x.toFixed(4)}%`;
+  const pct = x * 100;
+  const sign = pct > 0 ? "+" : "";
+  return `${sign}${pct.toFixed(4)}%/h`;
 }
 function fmtX(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "?";
@@ -205,7 +206,7 @@ async function tgSend(env: Env, chatId: string, text: string): Promise<void> {
 /* =================== Hyperliquid REST =================== */
 
 async function hlInfo(env: Env, body: any): Promise<any> {
-  const r = await fetch(HL_INFO(env), {
+  const r = await fetch(HL_INFO_URL(env), {
     method: "POST",
     headers: { "content-type": "application/json", "user-agent": "hl-liq-alerts/worker" },
     body: JSON.stringify(body),
@@ -214,8 +215,8 @@ async function hlInfo(env: Env, body: any): Promise<any> {
   return await r.json();
 }
 
-/** Returns both marks and hourly funding rates from `metaAndAssetCtxs`. */
-async function getMarksAndFunding(env: Env): Promise<{ marks: Record<string, number>; funding: Record<string, number> }> {
+/** Fetch both mark prices and funding rates in one call. */
+async function getMarksAndFunding(env: Env): Promise<{ marks: Record<string, number>, funding: Record<string, number> }> {
   try {
     const meta_ctxs = await hlInfo(env, { type: "metaAndAssetCtxs" });
     let universe: any[] = [], ctxs: any[] = [];
@@ -229,9 +230,9 @@ async function getMarksAndFunding(env: Env): Promise<{ marks: Record<string, num
     for (let i = 0; i < names.length; i++) {
       const nm = names[i];
       const mp = Number(ctxs[i]?.markPx);
-      const fr = Number(ctxs[i]?.funding); // hourly funding rate (fraction)
+      const fr = Number(ctxs[i]?.funding); // HL provides 'funding' in asset ctxs
       if (nm && isFinite(mp) && mp > 0) marks[nm] = mp;
-      if (nm && isFinite(fr)) funding[nm] = fr;
+      if (nm && isFinite(fr)) funding[nm] = fr; // hourly funding rate (decimal), per HL info
     }
     return { marks, funding };
   } catch (e) {
@@ -402,14 +403,13 @@ async function writeState(env: Env, key: string, obj: any, ttlSeconds?: number):
 async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
   const lines: string[] = ["📊 <b>Per-Account Overview</b>"];
   const total = addresses.length;
-
-  // fetch once per report
+  // fetch marks + funding once
   const { marks, funding } = await getMarksAndFunding(env);
 
   for (let i = 0; i < addresses.length; i++) {
     const addr = addresses[i];
     const ov = await getAccountOverview(env, addr);
-    const title = `<b>Account ${i + 1}</b>\n🔗 <code>${addr}</code>`;
+    const title = `<b>Account ${i + 1}</b>\n🔑 Address: <code>${addr}</code>`;
 
     if (!ov) {
       lines.push(`${title}\n\n( no data )`);
@@ -435,7 +435,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMa
       );
     }
 
-    // Isolated block: coin / leverage / health / funding(1h)
+    // Isolated block: coin / leverage / funding / health
     const raw = ov.raw;
     const { isoPos } = classifyPositions(raw, mmUsed);
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
@@ -469,7 +469,7 @@ async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Rec
     const mmUsed = Number(ov.crossMaintMargin || 0) > 0;
     const { isoPos } = classifyPositions(raw, mmUsed);
 
-    const title = `<b>Account ${i + 1}</b>\n🔗 <code>${addr}</code>`;
+    const title = `<b>Account ${i + 1}</b>\n🔑 Address: <code>${addr}</code>`;
     const h = healthAccountPct(ov.accountValue, ov.crossMaintMargin, ov.unrealizedPnl);
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
@@ -501,14 +501,13 @@ async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Rec
   return lines.join("\n");
 }
 
-/* ----- isolated position lines (coin, leverage, health, funding) ----- */
-function renderPositionLines(p: any, marks: Record<string, number>, funding: Record<string, number>): string[] {
+/* ----- isolated position lines (coin, leverage, funding, health) ----- */
+function renderPositionLines(p: any, marks: Record<string, number>, fundingMap: Record<string, number>): string[] {
   const coin = p.coin;
   const liq = p.liquidationPx as number | null;
   const entry = p.entryPx as number;
   const side = (p.side || "").toLowerCase();
   const mark = marks[coin];
-  const fr = funding[coin]; // hourly fraction
 
   // Compute leverage from entry & liq (preferred)
   let levRaw = NaN;
@@ -531,13 +530,12 @@ function renderPositionLines(p: any, marks: Record<string, number>, funding: Rec
     ? healthPosPct(mark, liq as number, entry, side)
     : null;
 
-  // Funding percent per hour display
-  const frPct = isFinite(fr) ? fr * 100 : null;
+  const fr = fundingMap[coin]; // hourly decimal, e.g. 0.0002 => 0.02%/h
 
   return [
     `🪙 ${coin}`,
     `📈 Leverage: ${isFinite(levDisplay) ? `${levDisplay}x` : "?"}`,
-    `💸 Funding (1h): ${frPct == null ? "?" : fmtPct4(frPct)}`,
+    `🔁 Funding: ${fr == null ? "?" : fmtSignedPctPerHour(fr)}`,
     `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
   ];
 }
