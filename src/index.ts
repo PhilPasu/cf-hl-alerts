@@ -1,14 +1,14 @@
 export interface Env {
   TG_BOT_TOKEN: string;
   TG_CHAT_ID: string; // default chat for cron alerts
-  ADDRESSES_CSV: string; // e.g. "Desk A|0xabc..., 0xdef..., Team - 0x123..."
+  ADDRESSES_CSV: string; // "Name|0xabc..., 0xdef..., Team - 0x123..."
   HL_INFO?: string; // optional override
   HL_ALERT_STATE: KVNamespace; // KV binding for cooldowns/state
 
   // Optional: identify cron expressions (so we know which fired)
-  POLL_CRON?: string;   // default: "*/1 * * * *"   (every minute)
-  DAILY_CRON?: string;  // default: "0 2 * * *"     (09:00 Bangkok)
-  DAILY_CRON_2?: string; // default: "0 14 * * *"   (21:00 Bangkok)
+  POLL_CRON?: string;  // default: "*/1 * * * *"
+  DAILY_CRON?: string; // default: "0 0 * * *"
+  DAILY_CRON_2?: string; // optional 2nd daily
 }
 
 type Update = {
@@ -52,7 +52,7 @@ export default {
             chatId,
             [
               "Commands:",
-              "/status — per-account: 🔷 Cross (Leverage / Health), then 🟨 Isolated (coin / leverage / health)",
+              "/status — per-account: 🔷 Cross (Leverage / Health), then 🟨 Isolated (coin / leverage / health / funding)",
               "/positions — same structure as /status",
               "/ping — check if bot is alive",
             ].join("\n")
@@ -69,13 +69,13 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
     try {
-      const pollExpr   = env.POLL_CRON    || "*/1 * * * *";
-      const dailyExpr1 = env.DAILY_CRON   || "0 2 * * *";   // 09:00 Bangkok (UTC+7)
-      const dailyExpr2 = env.DAILY_CRON_2 || "0 14 * * *";  // 21:00 Bangkok (UTC+7)
+      const pollExpr = env.POLL_CRON || "*/1 * * * *";
+      const dailyExpr = env.DAILY_CRON || "0 0 * * *";
+      const dailyExpr2 = env.DAILY_CRON_2 || ""; // optional second daily run
       const which = (event as any).cron as string | undefined;
 
-      // Twice-daily summary (09:00 & 21:00 Bangkok)
-      if (which === dailyExpr1 || which === dailyExpr2) {
+      // Daily summaries
+      if (which === dailyExpr || (dailyExpr2 && which === dailyExpr2)) {
         const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
         const report = await buildAccountOverviewReport(env, addresses, nameMap);
@@ -85,12 +85,12 @@ export default {
         return;
       }
 
-      // Frequent poll (e.g., every minute): tiered health alerts with per-day gating
+      // Frequent poll (tiered alerts), once per tier per day
       if (which === pollExpr || which === undefined) {
         const { addresses } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
 
-        const today = todayKeyUTC(); // resets automatically at new UTC day
+        const today = todayKeyUTC();
 
         for (let i = 0; i < addresses.length; i++) {
           const addr = addresses[i];
@@ -109,15 +109,13 @@ export default {
           const key = `acct:${addr}:${today}`;
           const state = (await readState(env, key)) || { sent: {} as Record<string, boolean> };
 
-          // Only send this tier once per day
           if (!state.sent[String(tier)]) {
             const idx = i + 1;
-            const title = `<b>Account ${idx}</b>`;
+            const title = `<b>Account ${idx}</b>\n<code>${addr}</code>`;
             const threshTxt = tierThreshText(tier);
             const msg = [
               `⚠️ <b>Near Liquidation</b> — Level ${tier}/4 (${threshTxt})`,
               `${title}`,
-              `🧾 Address: <code>${addr}</code>`,
               "",
               `📈 Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
               `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
@@ -125,7 +123,7 @@ export default {
 
             await tgSend(env, env.TG_CHAT_ID, msg);
             state.sent[String(tier)] = true;
-            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // ~26h
+            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26);
           }
         }
       }
@@ -157,13 +155,6 @@ function chunkMessage(text: string): string[] {
   return chunks;
 }
 
-function shortAddr(addr: string): string {
-  return addr.length > 10 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
-}
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<string, string> } {
   const items = (csv || "").split(",").map(s => s.trim()).filter(Boolean);
   const ADDR = /0x[a-fA-F0-9]{40}/;
@@ -174,11 +165,6 @@ function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<stri
     if (!m) continue;
     const addr = m[0];
     if (!addresses.includes(addr)) addresses.push(addr);
-
-    // Optional name prefix (e.g., "Desk A|0x...", "Team - 0x...")
-    const idx = it.indexOf(addr);
-    const prefix = idx > 0 ? it.slice(0, idx).trim().replace(/[|\-:–—]+$/g, "").trim() : "";
-    if (prefix) nameMap[addr] = prefix;
   }
   return { addresses, nameMap };
 }
@@ -186,6 +172,13 @@ function parseAddrBook(csv: string): { addresses: string[]; nameMap: Record<stri
 function fmtPct(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "?";
   return `${x.toFixed(2)}%`;
+}
+function fmtSmallPctFromDecimal(x: number | null | undefined): string {
+  // x is decimal (e.g., 0.0005 => 0.05%)
+  if (x == null || !isFinite(x)) return "?";
+  const pct = x * 100;
+  const sign = pct > 0 ? "+" : "";
+  return `${sign}${pct.toFixed(4)}%/h`;
 }
 function fmtX(x: number | null | undefined): string {
   if (x == null || !isFinite(x)) return "?";
@@ -222,7 +215,8 @@ async function hlInfo(env: Env, body: any): Promise<any> {
   return await r.json();
 }
 
-async function getMetaAndMarks(env: Env): Promise<Record<string, number>> {
+/** Returns both marks and hourly funding (decimal) keyed by coin name. */
+async function getMarksAndFunding(env: Env): Promise<{ marks: Record<string, number>, fundingH1: Record<string, number> }> {
   try {
     const meta_ctxs = await hlInfo(env, { type: "metaAndAssetCtxs" });
     let universe: any[] = [], ctxs: any[] = [];
@@ -232,15 +226,20 @@ async function getMetaAndMarks(env: Env): Promise<Record<string, number>> {
     }
     const names = universe.map(u => u?.name);
     const marks: Record<string, number> = {};
+    const fundingH1: Record<string, number> = {};
     for (let i = 0; i < names.length; i++) {
       const nm = names[i];
-      const mp = Number(ctxs[i]?.markPx);
+      const ctx = ctxs[i] || {};
+      const mp = Number(ctx?.markPx);
       if (nm && isFinite(mp) && mp > 0) marks[nm] = mp;
+
+      const f = Number(ctx?.funding);
+      if (nm && isFinite(f)) fundingH1[nm] = f; // decimal per hour (e.g., 0.0005 => 0.05%/h)
     }
-    return marks;
+    return { marks, fundingH1 };
   } catch (e) {
-    console.warn("getMetaAndMarks failed:", e);
-    return {};
+    console.warn("getMarksAndFunding failed:", e);
+    return { marks: {}, fundingH1: {} };
   }
 }
 
@@ -403,18 +402,18 @@ async function writeState(env: Env, key: string, obj: any, ttlSeconds?: number):
 
 /* =================== Rendering helpers =================== */
 
-async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap: Record<string, string>): Promise<string> {
+async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
   const lines: string[] = ["📊 <b>Per-Account Overview</b>"];
   const total = addresses.length;
+  const { marks, fundingH1 } = await getMarksAndFunding(env);
 
   for (let i = 0; i < addresses.length; i++) {
     const addr = addresses[i];
     const ov = await getAccountOverview(env, addr);
-    const human = nameMap[addr] ? ` — ${escapeHtml(nameMap[addr])}` : "";
-    const title = `<b>Account ${i + 1}</b>`;
+    const title = `<b>Account ${i + 1}</b>\n<code>${addr}</code>`;
 
     if (!ov) {
-      lines.push(`${title}\n🧾 Address: <code>${addr}</code>${human}\n\n( no data )`);
+      lines.push(`${title}\n\n( no data )`);
       if (i < total - 1) lines.push(SEP);
       continue;
     }
@@ -429,7 +428,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
-      crossBlock.push("( no positions found )");
+      crossBlock.push("( no cross exposure )");
     } else {
       crossBlock.push(
         `📈 Leverage: ${lev == null ? "?" : fmtX(lev)}`,
@@ -437,19 +436,18 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
       );
     }
 
-    // Isolated: coin / leverage / health
+    // Isolated block: coin / leverage / health / funding
     const raw = ov.raw;
     const { isoPos } = classifyPositions(raw, mmUsed);
-    const marks = await getMetaAndMarks(env);
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
-      isoBlock.push("( no positions found )");
+      isoBlock.push("( no open positions )");
     } else {
-      for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks), "");
+      for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks, fundingH1), "");
       if (isoBlock.at(-1) === "") isoBlock.pop();
     }
 
-    const joined = [title, `🧾 Address: <code>${addr}</code>${human}`, "", ...crossBlock, "", ...isoBlock]
+    const joined = [title, "", ...crossBlock, "", ...isoBlock]
       .join("\n")
       .replace(/\n\n\n+/g, "\n\n");
     lines.push(joined);
@@ -459,8 +457,8 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], nameMap
   return lines.join("\n");
 }
 
-async function buildPositionsReport(env: Env, addresses: string[], nameMap: Record<string, string>): Promise<string> {
-  const marks = await getMetaAndMarks(env);
+async function buildPositionsReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
+  const { marks, fundingH1 } = await getMarksAndFunding(env);
   const lines: string[] = ["📄 <b>Per-Position Status</b>"];
   const total = addresses.length;
 
@@ -468,17 +466,16 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
     const addr = addresses[i];
     const raw = await hlInfo(env, { type: "clearinghouseState", user: addr });
     const ov = computeOverviewFromRaw(raw);
-    const human = nameMap[addr] ? ` — ${escapeHtml(nameMap[addr])}` : "";
 
     const mmUsed = Number(ov.crossMaintMargin || 0) > 0;
     const { isoPos } = classifyPositions(raw, mmUsed);
 
-    const title = `<b>Account ${i + 1}</b>`;
+    const title = `<b>Account ${i + 1}</b>\n<code>${addr}</code>`;
     const h = healthAccountPct(ov.accountValue, ov.crossMaintMargin, ov.unrealizedPnl);
 
     const crossBlock: string[] = ["🔷 <b>Cross</b>", ""];
     if (!mmUsed) {
-      crossBlock.push("( no positions found )");
+      crossBlock.push("( no cross exposure )");
     } else {
       crossBlock.push(
         `📈 Leverage: ${ov.crossLeverage == null ? "?" : fmtX(ov.crossLeverage)}`,
@@ -488,13 +485,13 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
 
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
     if (!isoPos.length) {
-      isoBlock.push("( no positions found )");
+      isoBlock.push("( no open positions )");
     } else {
-      for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks), "");
+      for (const p of isoPos) isoBlock.push(...renderPositionLines(p, marks, fundingH1), "");
       if (isoBlock.at(-1) === "") isoBlock.pop();
     }
 
-    const chunk = [title, `🧾 Address: <code>${addr}</code>${human}`, "", ...crossBlock, "", ...isoBlock]
+    const chunk = [title, "", ...crossBlock, "", ...isoBlock]
       .join("\n")
       .replace(/\n\n\n+/g, "\n\n");
     lines.push(chunk);
@@ -505,13 +502,14 @@ async function buildPositionsReport(env: Env, addresses: string[], nameMap: Reco
   return lines.join("\n");
 }
 
-/* ----- isolated position lines (coin, leverage, health) ----- */
-function renderPositionLines(p: any, marks: Record<string, number>): string[] {
+/* ----- isolated position lines (coin, leverage, health, funding) ----- */
+function renderPositionLines(p: any, marks: Record<string, number>, fundingH1: Record<string, number>): string[] {
   const coin = p.coin;
   const liq = p.liquidationPx as number | null;
   const entry = p.entryPx as number;
   const side = (p.side || "").toLowerCase();
   const mark = marks[coin];
+  const funding = fundingH1[coin]; // decimal per hour
 
   // Compute leverage from entry & liq (preferred)
   let levRaw = NaN;
@@ -537,6 +535,7 @@ function renderPositionLines(p: any, marks: Record<string, number>): string[] {
   return [
     `🪙 ${coin}`,
     `📈 Leverage: ${isFinite(levDisplay) ? `${levDisplay}x` : "?"}`,
+    `💸 Funding rate: ${fmtSmallPctFromDecimal(isFinite(funding) ? funding : null)}`,
     `❤️ Health: ${h == null ? "?" : fmtPct(h)}`
   ];
 }
