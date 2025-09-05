@@ -7,8 +7,8 @@ export interface Env {
 
   // Optional cron identifiers so we know which fired
   POLL_CRON?: string;        // default: "*/1 * * * *"
-  DAILY_CRON?: string;       // first daily (e.g., 09:00 BKK = 02:00 UTC)
-  DAILY_CRON_2?: string;     // second daily (e.g., 21:00 BKK = 14:00 UTC)
+  DAILY_CRON?: string;       // e.g., "0 2 * * *" for 09:00 Bangkok
+  DAILY_CRON_2?: string;     // e.g., "0 14 * * *" for 21:00 Bangkok
 }
 
 type Update = {
@@ -69,12 +69,12 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
     try {
-      const pollExpr  = env.POLL_CRON  || "*/1 * * * *";
-      const dailyExpr = env.DAILY_CRON || "0 2 * * *";   // 09:00 Bangkok (UTC+7) = 02:00 UTC
-      const dailyExpr2= env.DAILY_CRON_2 || "0 14 * * *"; // 21:00 Bangkok = 14:00 UTC
+      const pollExpr   = env.POLL_CRON    || "*/1 * * * *";
+      const dailyExpr  = env.DAILY_CRON   || "0 2 * * *";   // 09:00 Bangkok (UTC+7) = 02:00 UTC
+      const dailyExpr2 = env.DAILY_CRON_2 || "0 14 * * *";  // 21:00 Bangkok = 14:00 UTC
       const which = (event as any).cron as string | undefined;
 
-      // Twice-daily summary (/status) — independent of near-liq alert gating
+      // Twice-daily status
       if (which === dailyExpr || which === dailyExpr2) {
         const { addresses, nameMap } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
@@ -85,12 +85,12 @@ export default {
         return;
       }
 
-      // Frequent poll (e.g., every minute): tiered health alerts with per-day gating
+      // Frequent poll: tiered health alerts with per-day gating
       if (which === pollExpr || which === undefined) {
         const { addresses } = parseAddrBook(env.ADDRESSES_CSV || "");
         if (!addresses.length) return;
 
-        const today = todayKeyUTC(); // resets automatically at new UTC day
+        const today = todayKeyUTC(); // resets on new UTC day
 
         for (let i = 0; i < addresses.length; i++) {
           const addr = addresses[i];
@@ -104,12 +104,11 @@ export default {
           const upnl = num(ov.unrealizedPnl);
           const h = healthAccountPct(balance, maint, upnl);
           const tier = tierFor(h);
-          if (tier === 0) continue; // no alert
+          if (tier === 0) continue;
 
           const key = `acct:${addr}:${today}`;
           const state = (await readState(env, key)) || { sent: {} as Record<string, boolean> };
 
-          // Only send this tier once per day
           if (!state.sent[String(tier)]) {
             const idx = i + 1;
             const title = `<b>Account ${idx}</b>\n🔑 Address: <code>${addr}</code>`;
@@ -124,7 +123,7 @@ export default {
 
             await tgSend(env, env.TG_CHAT_ID, msg);
             state.sent[String(tier)] = true;
-            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26); // ~26h to survive skews
+            await writeState(env, key, state, /*ttlSeconds=*/60 * 60 * 26);
           }
         }
       }
@@ -215,7 +214,7 @@ async function hlInfo(env: Env, body: any): Promise<any> {
   return await r.json();
 }
 
-/** Fetch both mark prices and funding rates in one call. */
+/** Robustly extract marks and funding for each coin. */
 async function getMarksAndFunding(env: Env): Promise<{ marks: Record<string, number>, funding: Record<string, number> }> {
   try {
     const meta_ctxs = await hlInfo(env, { type: "metaAndAssetCtxs" });
@@ -229,16 +228,95 @@ async function getMarksAndFunding(env: Env): Promise<{ marks: Record<string, num
     const funding: Record<string, number> = {};
     for (let i = 0; i < names.length; i++) {
       const nm = names[i];
-      const mp = Number(ctxs[i]?.markPx);
-      const fr = Number(ctxs[i]?.funding); // HL provides 'funding' in asset ctxs
+      const ctx = ctxs[i] ?? {};
+      const mp = Number(ctx?.markPx);
       if (nm && isFinite(mp) && mp > 0) marks[nm] = mp;
-      if (nm && isFinite(fr)) funding[nm] = fr; // hourly funding rate (decimal), per HL info
+
+      const fr = extractFundingRate(ctx);
+      if (nm && fr != null && isFinite(fr)) funding[nm] = fr;
     }
     return { marks, funding };
   } catch (e) {
     console.warn("getMarksAndFunding failed:", e);
     return { marks: {}, funding: {} };
   }
+}
+
+/** Try many shapes/keys to find a funding rate; normalize to fraction per hour. */
+function extractFundingRate(ctx: any): number | null {
+  // direct numeric fields
+  const directCandidates = [
+    ctx?.funding,
+    ctx?.fundingRate,
+    ctx?.hourlyFundingRate,
+    ctx?.nextFundingRate,
+    ctx?.assetCtx?.funding,
+    ctx?.assetCtx?.fundingRate,
+    ctx?.ctx?.funding,
+  ];
+  for (const v of directCandidates) {
+    const n = normalizeFundingNumber(v);
+    if (n != null) return n;
+  }
+
+  // object shapes with "current", "hourly", "rate", "value" etc.
+  const objCandidates = [ctx?.funding, ctx?.fundingInfo, ctx?.funding_rate, ctx?.rates, ctx?.assetCtx?.fundingInfo];
+  for (const obj of objCandidates) {
+    if (obj && typeof obj === "object") {
+      const tryKeys = ["hourly", "current", "rate", "value", "now", "last", "next"];
+      for (const k of tryKeys) {
+        const n = normalizeFundingNumber(obj[k]);
+        if (n != null) return n;
+      }
+    }
+  }
+
+  // deep scan: any key containing "fund"
+  const found = deepScanFunding(ctx);
+  if (found != null) return found;
+
+  return null;
+}
+
+function deepScanFunding(obj: any): number | null {
+  try {
+    const stack = [obj];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== "object") continue;
+      for (const [k, v] of Object.entries(cur)) {
+        if (typeof v === "object" && v) stack.push(v);
+        if (typeof k === "string" && /fund/i.test(k)) {
+          const n = normalizeFundingNumber(v);
+          if (n != null) return n;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/** Convert to fraction per hour; drop nonsense. */
+function normalizeFundingNumber(v: any): number | null {
+  if (v == null) return null;
+  let n = Number(v);
+  if (!isFinite(n)) {
+    // try parse string like "0.01%" etc.
+    if (typeof v === "string") {
+      const s = v.trim().replace(/%/g, "");
+      const p = Number(s);
+      if (isFinite(p)) n = p;
+    }
+  }
+  if (!isFinite(n)) return null;
+
+  // If looks like percent (>= 1), assume percent → convert to fraction
+  if (Math.abs(n) >= 1.0) n = n / 100;
+
+  // Sanity clamp: funding per HOUR almost always within +/- 0.1 (10%/h)
+  if (Math.abs(n) > 0.5) return null;
+
+  return n;
 }
 
 async function getAccountOverview(env: Env, addr: string) {
@@ -403,6 +481,7 @@ async function writeState(env: Env, key: string, obj: any, ttlSeconds?: number):
 async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMap: Record<string, string>): Promise<string> {
   const lines: string[] = ["📊 <b>Per-Account Overview</b>"];
   const total = addresses.length;
+
   // fetch marks + funding once
   const { marks, funding } = await getMarksAndFunding(env);
 
@@ -435,7 +514,7 @@ async function buildAccountOverviewReport(env: Env, addresses: string[], _nameMa
       );
     }
 
-    // Isolated block: coin / leverage / funding / health
+    // Isolated: coin / leverage / funding / health
     const raw = ov.raw;
     const { isoPos } = classifyPositions(raw, mmUsed);
     const isoBlock: string[] = ["🟨 <b>Isolated</b>", ""];
@@ -509,13 +588,13 @@ function renderPositionLines(p: any, marks: Record<string, number>, fundingMap: 
   const side = (p.side || "").toLowerCase();
   const mark = marks[coin];
 
-  // Compute leverage from entry & liq (preferred)
+  // leverage from entry & liq (preferred)
   let levRaw = NaN;
   if (isFinite(entry) && entry > 0 && isFinite(liq ?? NaN) && (liq as number) > 0) {
     const denom = side.startsWith("long") ? (entry - (liq as number)) : ((liq as number) - entry);
     if (denom > 0) levRaw = entry / denom;
   }
-  // Fallback: try leverage-like fields from payload
+  // fallback leverage-like fields
   if (!isFinite(levRaw) || levRaw <= 0) {
     const cands = [p.raw?.leverage, p.raw?.lev, p.raw?.x, p.raw?.risk?.leverage];
     for (const v of cands) {
@@ -530,7 +609,7 @@ function renderPositionLines(p: any, marks: Record<string, number>, fundingMap: 
     ? healthPosPct(mark, liq as number, entry, side)
     : null;
 
-  const fr = fundingMap[coin]; // hourly decimal, e.g. 0.0002 => 0.02%/h
+  const fr = fundingMap[coin]; // hourly fraction if available
 
   return [
     `🪙 ${coin}`,
